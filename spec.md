@@ -1,421 +1,294 @@
-# Strategy Specification: Regime-Adaptive Aggressive Alpha (RAAA)
+# Volatility Breakout Strategy Spec (BTC) — OKX Perpetual Futures
+> **v1.1** — 리뷰 반영, BTC 단일 자산 단순화
 
-## 1. Overview
-Multi-Asset, Multi-Timeframe, Regime-Switching 전략. 시장 상태를 4가지로 분류하고 각 Regime에 최적화된 공격적 매매 실행.
+---
 
--   **Core Philosophy**: "Adapt to the Regime, Attack with Precision, Compound Aggressively."
--   **Exchange**: OKX (Perpetual Futures / USDT-Margined Swap)
--   **Assets**: BTC/USDT Perp, ETH/USDT Perp
--   **Leverage**: 5× (고정)
--   **Margin Mode**: Isolated
--   **Direction**: Long & Short (양방향)
--   **Frequency**: High (15m Entry, 일 평균 2-5 trades 목표)
--   **Performance Target**: CAGR > 100%, Profit Factor > 1.8, Max DD < 30%
+## 0) 개요
 
-## 2. Timeframes & Data
+**전략 한 줄 요약**: 전일 변동폭(Range)의 k배를 당일 시가에 더한 가격을 돌파하면 진입, ATR 기반으로 청산.
 
-### 2.1 Timeframe Hierarchy
-| Layer | Timeframe | Purpose |
+**핵심 원칙**:
+- 파라미터 최소화 (핵심 파라미터 k값 1개)
+- 단일 자산 (BTC), 단일 타임프레임 신호
+- 매일 기회 탐색, 방향별 하루 1회 진입 (최대 Long 1 + Short 1 = 2회)
+- 피라미딩 금지
+
+**운용 조건**:
+- 거래소: OKX (USDT-Margined Perpetual Swap)
+- 자산: BTC/USDT-SWAP
+- 방향: Long & Short
+- 레버리지: 3× (Isolated Margin)
+- 초기 자본: $10,000
+
+---
+
+## 1) 데이터
+
+### 1.1 캔들
+- **15m OHLCV**: 돌파 신호 감지, 진입 실행, SL/TP 모니터링
+- **1H OHLCV**: 인디케이터 계산 (ATR, EMA)
+- **Daily OHLCV**: 전일 Range 계산
+
+### 1.2 인디케이터
+| 인디케이터 | 타임프레임 | 용도 |
 |---|---|---|
-| Regime | 4H | 시장 상태 분류 (Trend/Chop/Squeeze) |
-| Signal | 1H | 방향성 확인 + 신호 생성 |
-| Entry | 15m | 정밀 진입 타이밍 |
+| ATR(14) | 1H | 손절/익절 거리 |
+| EMA(50) | 1H | 방향 필터 |
+| Volume SMA(20) | 1H | 거래량 필터 (선택) |
+| Daily Range | Daily | 돌파 레벨 계산 |
+| Daily Range 20일 Percentile | Daily | 노이즈 필터 (최근 20일 Range 중 순위) |
 
-### 2.2 Data Sources
--   **Price Data (Core)**: OKX API - BTC/USDT-SWAP, ETH/USDT-SWAP (Perpetual Futures OHLCV)
-    -   라이브러리: `ccxt` (통합 거래소 API) 또는 OKX Python SDK
-    -   Rate Limit: 20 req/2s (OKX Public API)
--   **Funding Rate (Core)**: OKX API - 8시간마다 정산 (00:00, 08:00, 16:00 UTC)
-    -   Funding Rate는 백테스트 P&L에 필수 반영
-    -   Endpoint: `/api/v5/public/funding-rate-history`
--   **On-Chain Data (Enhanced)**: Glassnode / CryptoQuant API (옵션)
-    -   Exchange Netflow, MVRV Z-Score, Whale Tx Count, SOPR
-    -   *Note: 가격 데이터만으로 Core 전략 동작. On-Chain은 신호 강도 보정용.*
+### 1.3 펀딩 레이트
+- 수집: OKX `/api/v5/public/funding-rate-history`
+- 정산: 8H (00:00, 08:00, 16:00 UTC)
+- 기준: **현재 Predicted Funding Rate** 사용
+- 용도: P&L 반영, 극단 펀딩 시 진입 제한
 
-## 3. Regime Classification (4H)
+---
 
-4H 데이터 기반으로 시장을 4가지 상태로 분류. 매 4H Bar Close마다 재평가.
+## 2) 핵심 로직
 
-### State 1: Trending Bull
+### 2.1 일간 기준 정의
+- **1일(Day)**: UTC 00:00 ~ 23:59
+- **당일 시가(today_open)**: UTC 00:00 시점의 가격
+- **전일 Range**: `yesterday_high - yesterday_low` (UTC 기준 전일)
+
+### 2.2 돌파 레벨 계산 (매일 UTC 00:00에 갱신)
 ```
-조건: EMA(20) > EMA(50) > EMA(200)
-      AND ADX(14) > 25
-      AND +DI > -DI
+long_trigger  = today_open + k * yesterday_range
+short_trigger = today_open - k * yesterday_range
 ```
--   **허용 방향**: Long Only
--   **ETH 조건**: BTC도 Trending Bull이고 BTC 포지션이 활성화 상태일 때만 ETH Long 진입 허용
--   **전략**: Momentum Continuation, Pullback Entry
+- `k`: 0.5 (기본값, 최적화 대상)
+- 범위: 0.3 ~ 0.7에서 탐색
 
-### State 2: Trending Bear
+### 2.3 신호 판정 (매 15m 봉 마감 시)
 ```
-조건: EMA(20) < EMA(50) < EMA(200)
-      AND ADX(14) > 25
-      AND -DI > +DI
+Long Signal:  close_15m >= long_trigger
+Short Signal: close_15m <= short_trigger
 ```
--   **허용 방향**: Short Only
--   **전략**: Momentum Short, Breakdown Short
+- 같은 방향 재진입: 하루 1회 (실패한 동일 신호 재배팅 방지)
+- 반대 방향 진입: 허용 (쿨다운 충족 시)
+- 하루 최대 거래: 2회 (Long 1회 + Short 1회)
 
-### State 3: High Volatility Chop
+---
+
+## 3) 진입 규칙
+
+### 3.1 방향 필터
 ```
-조건: ADX(14) < 20
-      AND ATR Percentile(50) > 70th
+Long 허용:  latest_1h_close > EMA(50)_1h
+Short 허용: latest_1h_close < EMA(50)_1h
 ```
--   **허용 방향**: Long & Short (Mean Reversion)
--   **전략**: BB Mean Reversion, RSI Extreme Reversal
+- 돌파 신호가 발생해도 방향 필터와 불일치하면 진입하지 않음
+- EMA(50)는 가장 최근 확정된 1H 봉 기준
 
-### State 4: Low Volatility Squeeze
+### 3.2 노이즈 필터
 ```
-조건: ADX(14) < 20
-      AND ATR Percentile(50) < 30th
-      AND BB Width Percentile(50) < 20th
+yesterday_range < 20th percentile(최근 20일 Daily Range) → 진입 스킵
 ```
--   **허용 방향**: Long & Short (Breakout)
--   **전략**: Volatility Breakout, Squeeze Fire
+- 전일 변동폭이 극단적으로 작으면 의미 없는 돌파 가능성 높음
 
-### Regime Transition Rules
--   Regime 전환 시 **기존 포지션 유지** (Stop/TP가 관리)
--   단, **Trending → 반대 Trending 전환**(Bull→Bear, Bear→Bull) 시 즉시 전 포지션 청산
--   Regime 전환 후 **2 bars (8H) 쿨다운** 후 새 Regime 전략 적용
+### 3.3 펀딩 필터
+```
+|current_predicted_funding| > 0.30% → 해당 방향 신규 진입 금지
+```
+- Long 진입 시: predicted funding > +0.30%이면 스킵
+- Short 진입 시: predicted funding < -0.30%이면 스킵
 
-### Undefined Regime (No-Trade Zone)
--   **ADX 20~25 구간**: Trending과 Chop/Squeeze의 중간 지대
--   **EMA 순서 불완전**: EMA(20), EMA(50), EMA(200)가 명확한 순서가 아닌 경우 (예: 20 > 200 > 50)
--   **조치**: 신규 진입 중단, 기존 포지션은 Stop/TP로만 관리
--   **Regime 재확인**: 다음 4H Bar Close에서 재평가
+### 3.4 진입 실행
+- 신호 발생한 15m 봉 마감 시점에 시장가 진입
+- 진입과 동시에 손절/익절 가격 설정
 
-## 4. Entry Strategies by Regime
+---
 
-### 4.1 Trending Bull Strategies
+## 4) 청산 규칙
 
-#### A. Momentum Continuation (1H Signal → 15m Entry)
-**1H 조건**:
--   RSI(14) > 50 AND RSI < 80 (과매수 아닌 상승 모멘텀)
--   Close > EMA(20)
--   Volume > SMA(20) of Volume × 1.3
+### 4.1 손절 (Stop Loss)
+```
+Long:  entry_price - 1.5 * ATR(14)_1h
+Short: entry_price + 1.5 * ATR(14)_1h
+```
 
-**15m Entry**:
--   EMA(9) 터치 후 반등 (Pullback to fast MA)
--   또는 직전 15m High 돌파 + Volume Surge (> 2× avg)
+### 4.2 익절 (Take Profit)
+```
+Long:  entry_price + 2.5 * ATR(14)_1h
+Short: entry_price - 2.5 * ATR(14)_1h
+```
 
-#### B. Pullback Entry (1H Signal → 15m Entry)
-**1H 조건**:
--   RSI(14) drops to 40-50 range (건강한 조정)
--   Price touches EMA(50) or BB Middle Band(20)
--   ADX still > 25 (추세 유지 확인)
+### 4.3 시간 청산 (Time Stop)
+```
+진입 후 24시간 경과 시 → 현재가로 전량 청산
+```
+- 24시간 내 SL/TP 미도달 = 돌파 모멘텀 소멸로 판단
 
-**15m Entry**:
--   Bullish engulfing 또는 hammer 캔들 패턴
--   RSI(14) 15m이 30 이하에서 반등 시작
+### 4.4 SL/TP 모니터링 (15m 기반)
+- 매 15m 봉의 High/Low로 SL/TP 도달 여부 판정
+- SL 판정: Low ≤ SL (Long) 또는 High ≥ SL (Short)
+- TP 판정: High ≥ TP (Long) 또는 Low ≤ TP (Short)
+- **동일 15m 봉에서 SL/TP 동시 도달 시**: SL 우선 (보수적 처리)
 
-#### C. Breakout Continuation
-**1H 조건**:
--   Close > Donchian Channel(20) Upper
--   Volume > SMA(20) × 2.0 (Strong Volume Confirmation)
+### 4.5 청산 우선순위
+```
+1순위: 손절 (SL 도달 시 즉시)
+2순위: 익절 (TP 도달 시 즉시)
+3순위: 시간 청산 (24H 경과)
+```
 
-**15m Entry**:
--   Breakout bar close 이후 첫 pullback에서 진입
--   Stop: Donchian midline 아래
+### 4.6 청산 실행
+- 손절: 시장가
+- 익절: 시장가
+- 시간 청산: 시장가
 
-### 4.2 Trending Bear Strategies
-Bull 전략의 **Mirror** (방향만 반전):
--   Momentum Short: RSI < 50, Close < EMA(20), Volume surge
--   Rally Short: RSI rises to 50-60, touches EMA(50) from below
--   Breakdown Short: Close < Donchian(20) Lower
+---
 
-### 4.3 High Volatility Chop Strategies
+## 5) 포지션 사이징
 
-#### A. BB Mean Reversion
-**1H 조건**:
--   **Long**: Price ≤ Lower BB(20, 2.5) AND RSI(14) < 25
--   **Short**: Price ≥ Upper BB(20, 2.5) AND RSI(14) > 75
+### 5.1 기본 공식
+```
+risk_per_trade = 1.5% * NAV
+sl_distance = 1.5 * ATR(14)_1h
+sl_distance_pct = sl_distance / entry_price
 
-**15m Entry**:
--   Reversal candle confirmation (engulfing, pin bar)
--   Target: BB Middle Band (20)
--   Stop: 1 ATR beyond the BB band
+position_size_usd = risk_per_trade / sl_distance_pct
+margin_required = position_size_usd / leverage(3)
+```
 
-#### B. RSI Divergence Reversal
-**1H 조건**:
--   Bullish Divergence: Price makes Lower Low, RSI makes Higher Low
--   Bearish Divergence: Price makes Higher High, RSI makes Lower High
+### 5.2 사이즈 제한
+```
+max_margin = 25% * NAV
+max_notional = 75% * NAV  (= 25% * 3×)
 
-**15m Entry**:
--   Divergence 확인 후 RSI가 방향 전환 시작할 때
+if margin_required > max_margin:
+    position_size_usd = max_margin * leverage
+```
+> **참고**: BTC의 일반적 ATR(14)_1H 수준($200~$800)에서는 마진 캡(25%)이 대부분 binding됨.
+> 고변동성 구간(ATR > ~$1,100)에서만 리스크 공식이 직접 사이즈를 결정.
+> 이는 의도된 설계로, 마진 캡이 최대 노출을 제한하는 안전장치 역할.
 
-### 4.4 Low Volatility Squeeze Strategies
+### 5.3 예시 ($10,000 계좌, BTC $80,000, ATR 1H = $400)
+```
+risk = $10,000 * 1.5% = $150
+sl_distance = 1.5 * $400 = $600
+sl_pct = $600 / $80,000 = 0.75%
+position_size = $150 / 0.0075 = $20,000 (0.25 BTC)
+margin = $20,000 / 3 = $6,667
 
-#### A. Bollinger-Keltner Squeeze Breakout
-**1H 조건**:
--   BB(20, 2.0) 상단/하단이 Keltner Channel(20, 1.5 ATR) 내부로 수축
--   Squeeze 해제 시 (BB가 KC 외부로 확장)
--   **방향 결정**: Momentum Oscillator(12) 부호로 판단
+→ 마진 한도 $2,500(25%) 초과 → 축소
+→ 실제 포지션 = $2,500 * 3 = $7,500 (0.094 BTC)
+→ 실제 리스크 = $7,500 * 0.75% = $56.25 (0.56% NAV)
+```
 
-**15m Entry**:
--   Squeeze 해제 첫 15m Bar의 방향으로 진입
--   Volume > 2× avg 확인
+---
 
-#### B. Volume Spike Breakout
-**1H 조건**:
--   Volume > SMA(20) × 3.0 (극단적 볼륨)
--   Price가 최근 10bar 레인지 돌파
+## 6) 리스크 관리
 
-**15m Entry**:
--   돌파 방향 1st pullback에서 진입
+### 6.1 포지션 한도
+- 동시 포지션: 최대 1개
+- 최대 마진: NAV 25%
+- 최대 명목가치: NAV 75% (= 25% × 3×)
 
-## 5. Cross-Asset Signals (BTC ↔ ETH)
-
-### 5.1 Correlation-Based Adjustments
--   **Rolling Correlation(48H)** 모니터링
--   `Corr > 0.85`: 동일 방향 시그널 → 양쪽 모두 진입 (높은 확신)
--   `Corr 0.5-0.85`: 독립적 판단 (각 자산별 시그널 기준)
--   `Corr < 0.5`: Pair Divergence 기회 탐색 (하나 Long, 하나 Short)
-
-### 5.2 Leader-Follower
--   BTC가 먼저 Breakout/Breakdown → ETH에서 Follow-through 시그널 대기
--   ETH/BTC ratio가 극단값(±2σ) → Mean Reversion 진입
-
-### 5.3 Confidence Multiplier
-시그널 강도에 따라 포지션 사이즈 조정:
-| 조건 | Confidence | Size Multiplier |
+### 6.2 Drawdown 3단계
+| 단계 | 조건 | 조치 |
 |---|---|---|
-| 부정적 신호 (On-Chain/Funding 역풍) | Dampened | 0.5× |
-| 단일 자산 시그널 | Normal | 1.0× |
-| 양쪽 자산 동일 방향 확인 | High | 1.5× |
-| Cross-Asset + On-Chain 확인 | Very High | 2.0× |
+| 1단계 | DD ≥ 8% | risk_per_trade 50% 축소 |
+| 2단계 | DD ≥ 13% | 신규 진입 중지, 기존 관리만 |
+| 3단계 | DD ≥ 18% | 전 포지션 청산, 전략 정지 → **운영자 수동 해제 시까지 유지** |
 
-**중요**: Confidence Multiplier 적용 후에도 **단일 포지션 마진 25% 상한 유지** (초과 시 25%로 캡)
-
-## 6. Position Management
-
-### 6.1 Position Sizing (공격적, 레버리지 반영)
 ```
-Base Risk = 3% of Equity per trade
-Size (USD) = (Equity × 0.03) / (1.5 × ATR(14))
-Asset Quantity = Size (USD) / Current Price
-Required Margin = Size (USD) / Leverage(5×)
+DD = (Peak_NAV - Current_NAV) / Peak_NAV
 ```
--   Stop Width: **1.5 ATR** (기존 2 ATR 대비 공격적)
--   단일 포지션 최대 명목가치: Equity의**125%** (= Equity 25% × 5× Leverage)
--   단일 포지션 최대 마진: Equity의 **25%**
--   *Note: 레버리지는 자본 효율성 용도. 포지션 명목가치가 아닌 마진 기준으로 리스크 관리.*
 
-### 6.2 Pyramiding (추가 진입 - Trending Regime Only)
--   **적용 조건**: 현재 Regime이 **Trending Bull** 또는 **Trending Bear**일 때만 허용
--   **수익 조건**: 기존 포지션이 **1.5R 이상 수익** 중일 때
--   **추가 사이즈**: 초기 사이즈의 **50%**
--   **최대 추가**: 1회만 (총 2단계: 100% + 50% = 150%)
--   **평균 단가 재계산**:
-    ```
-    새 평균가 = (Entry1 × Size1 + Entry2 × Size2) / (Size1 + Size2)
-    ```
--   **손절 재계산**:
-    ```
-    Long: 새 Stop = 평균 단가 - 1.5 × ATR(14)
-    Short: 새 Stop = 평균 단가 + 1.5 × ATR(14)
-    ```
--   **R 기준 재계산**:
-    ```
-    피라미딩 후 1R = 재계산된 Stop 거리 (평균가 기준 1.5 ATR)
-    Partial TP의 2R/3R/4R은 새 평균가 + 새 R 기준으로 계산
-    ```
--   **Trailing Stop**: 전체 포지션 기준 최고점/최저점에서 2 ATR 추적
--   **제한사항**:
-    -   Mean Reversion 전략 (State 3): 피라미딩 금지
-    -   Squeeze Breakout 전략 (State 4): 피라미딩 금지
-    -   **Partial TP 후 피라미딩 금지**: 포지션 일부 청산 시작 후에는 추가 진입 불가
-    -   피라미딩 이후 Regime이 Chop/Squeeze로 전환되어도 기존 포지션 유지 (Stop/TP가 관리)
+### 6.3 일간 가드레일
+- 일 손실 ≥ 2.5% NAV 시 → 당일 신규 진입 중지 (UTC 기준 리셋)
+- 당일 2거래 모두 손절 시 → 당일 추가 진입 중지
+- 직전 4거래 연속 손절 시 → 다음 24시간 진입 중지
 
-### 6.3 Concurrent Positions
-| 항목 | 제한 |
+### 6.4 쿨다운
+- 손절 청산 후: 2시간 대기
+- 시간 청산 후: 1시간 대기
+- 익절 청산 후: 쿨다운 없음
+
+---
+
+## 7) 실행 / 비용 모델
+
+### 7.1 주문
+- 진입: 시장가
+- 청산: 시장가 (SL/TP/시간청산 모두)
+
+### 7.2 비용 (백테스트 기준)
+| 항목 | 값 |
 |---|---|
-| 자산별 최대 포지션 | 1 (Pyramid 포함 시 최대 2단계) |
-| 전체 최대 포지션 | **2 (BTC 1개 + ETH 1개)** |
-| 전체 최대 마진 사용 | Equity의 **50%** (2 positions × 25% each) |
-| 전체 최대 명목가치 | Equity의 **250%** (= 50% × 5× Leverage) |
-| 동일 방향 최대 | 2 (BTC + ETH both Long or both Short) |
+| Taker 수수료 | 0.05% |
+| 슬리피지 | 0.03% |
+| 펀딩 | 8H 실데이터 반영 |
 
-### 6.4 Cooldown
--   **손실 청산 후**: 30분 (2 × 15m bars)
--   **수익 청산 후**: 15분 (1 × 15m bar)
--   **Regime 전환 후**: 8시간 (2 × 4H bars)
--   **적용 시점**: 포지션 **전량 청산** 시에만 적용 (Partial TP에는 미적용)
+> 모든 주문이 시장가이므로 Maker 수수료 불필요.
 
-## 7. Exit & Risk Management
+### 7.3 청산(Liquidation) 방어
+```
+liq_price (Long) = entry * (1 - 1/leverage + maintenance_margin_rate)
+```
+- 진입 시 청산가까지 거리가 3 × ATR 미만이면 사이즈 축소
+- **참고**: 3× 레버리지에서 청산가 거리 ≈ 33%로, SL(~0.75%)보다 훨씬 멀어 실질 트리거 가능성 극히 낮음. 안전장치로 유지.
 
-### 7.1 Initial Stop Loss
--   **Stop Width**: 1.5 × ATR(14) (Entry Price 기준)
--   **Long**: Entry - 1.5 ATR
--   **Short**: Entry + 1.5 ATR
+---
 
-### 7.2 Trailing Stop (Chandelier Exit)
--   **활성화**: 수익 > 1R
--   **Trail**: Highest High(Long) / Lowest Low(Short) 기준 2 ATR
--   **업데이트 주기**: 매 15m Bar Close
--   **단, Mean Reversion 전략 (State 3)**: Trailing Stop 미사용, 고정 TP만
+## 8) 백테스트
 
-### 7.3 Take Profit (Partial Exit)
-수익 극대화를 위한 분할 청산:
-| 수익 도달 | 청산 비율 | 잔여 포지션 |
+### 8.1 기간
+- 전체: 2025-02-01 ~ 2026-02-01
+- 워밍업: EMA(50) ≈ 50 × 1H bars + Daily Range Percentile ≈ 20 Daily bars
+- **실 시작: ~2025-02-21** (워밍업 약 20일 소요)
+
+### 8.2 검증 방법
+- **Anchored Walk-Forward**: 초기 IS 180일, OOS 60일, 60일 단위 전진
+  - Fold 1: IS Day 1~180, OOS Day 181~240
+  - Fold 2: IS Day 1~240, OOS Day 241~300
+  - Fold 3: IS Day 1~300, OOS Day 301~365
+- k값 최적화는 IS 구간에서만 수행
+
+### 8.3 합격 기준 (OOS)
+| 지표 | 최소 기준 | 목표 |
 |---|---|---|
-| 2R | 40% | 60% |
-| 3R | 30% | 30% |
-| 4R+ | Trail | Trailing Stop까지 보유 |
+| Profit Factor | > 1.3 | > 1.6 |
+| Win Rate | > 45% | > 52% |
+| Max DD | < 20% | < 15% |
+| CAGR | > 20% | > 50% |
+| 강제 청산 | 0회 | 0회 |
 
-**Mean Reversion (State 3) 전용**:
-| Target | 청산 비율 |
-|---|---|
-| BB Middle Band | 60% |
-| 반대편 BB(1σ) | 40% |
+### 8.4 안정성 체크
+- k값 ±0.1 변동 시 성과 급변 여부 확인
+- ATR 배수 ±20% 변동 시 성과 급변 여부 확인
 
-### 7.4 Time Stop
--   **Trending 전략**: 24시간(96 × 15m bars) 내 1R 미도달 시 청산
--   **Mean Reversion**: 12시간(48 × 15m bars) 내 TP 미도달 시 청산
--   **Squeeze Breakout**: 6시간(24 × 15m bars) 내 1R 미도달 시 청산
+---
 
-### 7.5 Regime Change Exit
--   **Trending Bull → Trending Bear** (또는 반대): 즉시 전 포지션 Market Close
--   **Trending → Chop/Squeeze**: 기존 포지션 유지, Trailing Stop이 관리
--   **Chop/Squeeze → Trending**: 기존 Mean Reversion 포지션의 Stop 타이트닝 (1 ATR로 축소)
+## 부록 A) 파라미터 요약
 
-### 7.6 Liquidation Defense (선물 전용)
--   **Isolated Margin** 모드이므로 각 포지션별 청산가 독립 관리
--   **청산가 버퍼**: 진입 시 청산가 대비 최소 **3 ATR** 이상 거리 확보
--   **마진 비율 모니터링**: 포지션 마진 비율 > 80% → 포지션 50% 축소
--   **ADL(Auto-Deleveraging) 방어**: 미실현 수익 큰 포지션은 분할 청산으로 ADL 리스크 완화
+| 카테고리 | 파라미터 | 기본값 | 최적화 범위 |
+|---|---|---|---|
+| 핵심 | k (돌파 계수) | 0.5 | 0.3 ~ 0.7 |
+| 손절 | SL ATR 배수 | 1.5 | 1.0 ~ 2.5 |
+| 익절 | TP ATR 배수 | 2.5 | 2.0 ~ 4.0 |
+| 시간 | Time Stop | 24H | 12H ~ 36H |
+| 필터 | EMA 기간 | 50 | 20 ~ 100 |
+| 필터 | Range Percentile 기준 | 20th | 10 ~ 30 |
+| 사이징 | risk_per_trade | 1.5% | 1.0 ~ 2.5% |
+| 사이징 | max_margin | 25% | 20 ~ 30% |
+| 리스크 | DD 1단계 | 8% | 고정 |
+| 리스크 | DD 2단계 | 13% | 고정 |
+| 리스크 | DD 3단계 | 18% | 고정 (수동 해제) |
+| 실행 | 레버리지 | 3× | 고정 |
+| 쿨다운 | 손절 후 대기 | 2H | 1 ~ 4H |
 
-## 8. Global Risk Controls
+> **최적화 대상**: k, SL/TP ATR 배수, Time Stop, EMA 기간 (총 5개)
+> **고정 파라미터**: DD 단계, 레버리지, 포지션 한도 (리스크 관리는 건드리지 않음)
 
-### 8.1 Drawdown Limits
-| Level | 조치 |
-|---|---|
-| DD > 15% | 포지션 사이즈 50%로 축소 |
-| DD > 20% | 신규 진입 중단, 기존 포지션만 관리 |
-| DD > 30% | 전 포지션 청산, 전략 완전 정지 |
+---
 
-### 8.2 Daily Loss Limit
--   일일 손실 > **Equity의 5%** → 당일 신규 진입 중단 (UTC 기준)
--   익일 00:00 UTC에 리셋
-
-### 8.3 Volatility Scaling
--   ATR Percentile > 90th → 포지션 사이즈 **50%로 축소** (극단적 변동성)
--   ATR Percentile > 95th → **신규 진입 중단** (Black Swan 방어)
-
-### 8.4 Correlation Risk
--   BTC-ETH Correlation > 0.9 → 전체 마진 합계를 **Equity 40%로 제한** (기본 50% → 40% 축소)
--   *이유: 높은 상관관계 = 사실상 단일 포지션과 동일한 리스크*
-
-### 8.5 Funding Rate Risk
--   **Funding Rate > ±0.1%**: 해당 방향 신규 진입 시 Confidence -1 (비용 부담 큼)
--   **Funding Rate > ±0.3%**: 해당 방향 신규 진입 중단 (극단적 Funding 비용)
--   **포지션 보유 시**: 8시간마다 Funding 비용/수익을 P&L에 반영
--   *Note: 역방향 포지션(Funding 수취 측)은 Confidence +1 보너스*
-
-### 8.6 Leverage & Liquidation Risk
--   **레버리지**: 5× 고정 (변경 금지)
--   **마진 모드**: Isolated (포지션 간 리스크 격리)
--   **계좌 잔고 대비 총 마진 사용률 > 50%**: 신규 진입 중단 (전체 최대 마진 한도)
--   **개별 포지션 마진 비율 > 80%**: 해당 포지션 50% 강제 축소
-
-## 9. On-Chain & Funding Signals (Enhanced Layer)
-
-Core 전략은 가격 데이터 + Funding Rate로 동작. On-Chain은 **신호 강도 조정** 용도.
-
-### 9.1 Signal Boosters (Confidence +1 Level)
--   **Exchange Netflow < 0** (순유출): Long 시그널 강화
--   **MVRV Z-Score < 0**: 역사적 저평가 구간 → Long 강화
--   **SOPR < 1.0**: 손실 매도 구간 → Contrarian Long 강화
--   **Whale Tx Count 급증 + Price 상승**: 대형 매수 확인 → Long 강화
-
-### 9.2 Signal Dampeners (Confidence -1 Level)
--   **Exchange Netflow > 0** (순유입): Long 시그널 약화 / Short 강화
--   **MVRV Z-Score > 3**: 역사적 과열 → Long 약화
--   **Funding Rate > 0.05%**: 과도한 롱 포지션 → Long 주의 (OKX 실시간 Funding Rate 사용)
--   **SOPR > 1.05**: 차익 실현 구간 → 신규 Long 자제
-
-### 9.3 Confidence → Size Mapping
-| Confidence Level | Size Multiplier |
-|---|---|
-| Dampened (-1) | 0.5× |
-| Normal (0) | 1.0× |
-| Boosted (+1) | 1.5× |
-| Strong (+2) | 2.0× |
-
-## 10. Required Indicators
-
-### 10.1 Trend & Momentum
--   EMA: 9, 20, 50, 200
--   RSI: 14
--   ADX: 14 (with +DI, -DI)
--   Momentum Oscillator: 12
-
-### 10.2 Volatility
--   ATR: 14 (+ Percentile Rank over 50 bars)
--   Bollinger Bands: (20, 2.0) and (20, 2.5)
--   Keltner Channel: (20, 1.5 × ATR)
--   BB Width Percentile: 50 bars
-
-### 10.3 Structure
--   Donchian Channel: 20
--   Volume SMA: 20
-
-### 10.4 Cross-Asset
--   BTC-ETH Rolling Correlation: 48 bars (4H 기준)
--   ETH/BTC Ratio: Bollinger Bands(20, 2.0)
-
-## 11. Backtest Parameters
--   **Period**: 2025-02-01 to 2026-02-01 (1 Year)
--   **Exchange**: OKX
--   **Assets**: BTC/USDT-SWAP, ETH/USDT-SWAP (Perpetual Futures)
--   **Timeframes**: 4H, 1H, 15m
--   **Initial Capital**: $100,000 (USDT)
--   **Leverage**: 5× (Isolated Margin)
--   **Order Type**: Market Orders
--   **Fees**: 0.05% per trade (OKX Taker Fee, Tier 1 기준)
--   **Slippage**: 0.02% per trade (고빈도 매매 반영)
--   **Funding Rate**: 8시간마다 정산 (OKX 히스토리컬 Funding Rate 데이터 사용)
-    -   Long 포지션: Funding > 0이면 비용 지불, Funding < 0이면 수취
-    -   Short 포지션: Funding > 0이면 수취, Funding < 0이면 비용 지불
--   **Liquidation**: Isolated 모드 청산가 시뮬레이션 포함
-
-## 12. Walk-Forward Validation
--   **Method**: Anchored Walk-Forward
--   **Split**: 70% In-Sample / 30% Out-of-Sample
--   **Optimization Objective**: Maximize CAGR while DD < 30%
--   **Stability Check**: OOS Profit Factor > 1.5, OOS Win Rate > 45%
--   **Parameter Sensitivity**: ±20% 변동에도 성과 유지 확인
-
-## 13. Implementation Plan
-1.  **Data Pipeline** (`data/pipeline.py`):
-    -   OKX API (`ccxt` 라이브러리) 통한 BTC/USDT-SWAP, ETH/USDT-SWAP 15m/1H/4H OHLCV 수집
-    -   OKX Funding Rate 히스토리 수집 (`/api/v5/public/funding-rate-history`)
-    -   전체 Indicator 계산 (Section 10 참조)
-    -   Cross-Asset Correlation 계산
-    -   ATR/BB Width Percentile 계산
-2.  **Regime Engine** (`strategies/regime.py`):
-    -   4H Regime 분류 로직
-    -   Regime 전환 감지 및 쿨다운 관리
-3.  **Strategy Module** (`strategies/raaa_strategy.py`):
-    -   Regime별 Entry 로직 (Section 4)
-    -   Cross-Asset Signal 처리 (Section 5)
-    -   Position/Exit Management (Section 6-7)
-    -   레버리지 반영 포지션 사이징 (Section 6.1)
-4.  **Risk Manager** (`strategies/risk_manager.py`):
-    -   Global Risk Controls (Section 8)
-    -   Drawdown/Daily Limit 모니터링
-    -   Volatility/Correlation Scaling
-    -   Funding Rate 비용 관리 (Section 8.5)
-    -   청산 방어 로직 (Section 7.6, 8.6)
-    -   **Position Limit 관리**: 전체 2-position (BTC 1 + ETH 1), 전체 마진 50% 한도 적용
-    -   **Confidence Multiplier 마진 캡**: Confidence 적용 후 단일 포지션 마진 25% 초과 시 제한
-5.  **Backtest Engine** (`backtest/engine.py`):
-    -   Multi-asset 동시 시뮬레이션
-    -   Partial Exit 지원
-    -   Pyramiding 지원
-    -   **Funding Rate 정산 시뮬레이션** (8시간 주기)
-    -   **Isolated Margin 청산가 시뮬레이션**
-6.  **On-Chain Module** (`data/onchain.py`) - Optional:
-    -   API Integration (Glassnode/CryptoQuant)
-    -   Confidence Score 계산
-7.  **Optimization** (`results/optimization_report.md`):
-    -   Walk-Forward 최적화
-    -   Parameter Stability Analysis
+## 부록 B) v2 확장 후보
+- ETH/USDT-SWAP 추가 (멀티 에셋 확장)
+- Funding Rate Exploitation 엔진
+- 세션별 k값 분리 (아시아/유럽/미국)
+- 거래량 가중 돌파 레벨
+- 변동성 국면별 k값 자동 조절

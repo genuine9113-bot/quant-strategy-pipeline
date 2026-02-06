@@ -1,0 +1,74 @@
+# BTC Volatility Breakout Strategy - Configuration
+# 이 파일의 값을 수정하여 백테스트 파라미터를 조정할 수 있습니다.
+
+# === 백테스트 기간 ===
+backtest:
+  start_date: "2025-02-01"
+  end_date: "2026-02-01"
+  initial_capital: 10000.0
+
+# === 핵심 전략 파라미터 ===
+strategy:
+  # 돌파 계수 (0.3 ~ 0.7 최적화 범위)
+  k: 0.6
+  
+  # 손절 ATR 배수 (1.0 ~ 2.5 최적화 범위)
+  sl_atr_mult: 1.50
+  
+  # 익절 ATR 배수 (2.0 ~ 4.0 최적화 범위)
+  tp_atr_mult: 1.00
+  
+  # Time Stop (시간, 12 ~ 36 최적화 범위)
+  time_stop_hours: 22
+
+# === 필터 파라미터 ===
+filters:
+  # EMA 기간 (20 ~ 100 최적화 범위)
+  ema_period: 40
+  
+  # Range Percentile 임계값 (10 ~ 30)
+  range_pct_threshold: 20.0
+  
+  # 펀딩 레이트 임계값 (%)
+  funding_threshold: 0.30
+
+# === 포지션 사이징 ===
+sizing:
+  # 거래당 리스크 (NAV 대비 %)
+  risk_per_trade: 0.100  # 0.5%
+  
+  # 최대 마진 (NAV 대비 %)
+  max_margin_pct: 0.25  # 25%
+  
+  # 레버리지 (고정)
+  leverage: 5.0
+
+# === 리스크 관리 (DD 단계) ===
+risk:
+  # DD 1단계: 리스크 50% 축소
+  dd_stage1: 0.50  # 8%
+  
+  # DD 2단계: 신규 진입 중지
+  dd_stage2: 1.00  # 13%
+  
+  # DD 3단계: 전략 정지 (수동 해제)
+  dd_stage3: 1.00  # 18%
+  
+  # 일간 손실 한도 (NAV 대비)
+  daily_loss_limit: 0.200  # 2.5%
+
+# === 쿨다운 ===
+cooldown:
+  # 손절 후 대기 시간 (시간)
+  cooldown_sl_hours: 2
+  
+  # Time Stop 후 대기 시간 (시간)
+  cooldown_time_hours: 1
+
+# === 실행 비용 ===
+execution:
+  # Taker 수수료
+  taker_fee: 0.0005  # 0.05%
+  
+  # 슬리피지
+  slippage: 0.0003  # 0.03%
