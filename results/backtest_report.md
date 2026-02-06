@@ -1,20 +1,46 @@
-# BTC Strategy Backtest Report
+# RAAA Strategy Backtest Report
+
+**Backtest Period**: 2025-03-06 to 2026-02-01
+
+**Initial Capital**: $100,000.00
+**Final Equity**: $85,876.27
 
 ## Summary
-- **Period**: 2026-01-04 18:30:00 to 2026-01-17 07:45:00
-- **Total Trades**: 8
-- **Win Rate**: 37.50%
-- **Profit Factor**: 1.36
-- **Expectancy**: $34.84 per trade
 
-## Financials
-- **Initial Capital**: $100,000.00
-- **Final Equity**: $95,314.33
-- **Total Return**: -4.69%
+- **Total Return**: -14.12%
+- **CAGR**: -15.42%
+- **Max Drawdown**: -53.58%
+- **Sharpe Ratio**: 0.07
+- **Calmar Ratio**: -0.29
 
-## Trade Analysis
-- **Avg Win**: $350.78
-- **Avg Loss**: $154.73
-- **Best Trade**: $684.10
-- **Worst Trade**: $-349.15
+## Performance vs Targets
 
+| Metric | Target | Achieved | Status |
+|--------|--------|----------|--------|
+| CAGR | > 100% | -15.42% | ❌ |
+| Max DD | < 30% | 53.58% | ❌ |
+| Profit Factor | > 1.8 | 1.41 | ❌ |
+| Win Rate | > 45% | 57.89% | ✅ |
+
+## Trade Statistics
+
+- **Total Trades**: 19
+- **Winning Trades**: 11
+- **Losing Trades**: 8
+- **Win Rate**: 57.89%
+- **Profit Factor**: 1.41
+- **Avg Win**: $554.93
+- **Avg Loss**: $-542.50
+- **Avg Holding Time**: 8.3 hours
+- **Liquidations**: 0
+- **Pyramids**: 4
+
+## Funding Impact
+
+- **Total Funding Paid**: $0.00
+- **Total Funding Received**: $0.00
+- **Net Funding P&L**: $0.00
+
+## Conclusion
+
+❌ **Strategy FAILED**: Some targets not met. Further optimization required.

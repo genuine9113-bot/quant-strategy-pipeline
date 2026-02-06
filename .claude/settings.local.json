@@ -1,7 +1,22 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(if [ -d \"venv\" ])",
+      "Bash(then source venv/bin/activate)",
+      "Bash(else echo \"venv not activated\")",
+      "Bash(fi)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "mcp__ide__executeCode",
+      "Bash(git -C /Users/itsgeonu/quant-strategy-pipeline show HEAD:results/backtest_report.md)",
+      "Bash(git -C /Users/itsgeonu/quant-strategy-pipeline show HEAD:backtest/engine.py)",
+      "Bash(git -C /Users/itsgeonu/quant-strategy-pipeline show HEAD:results/trade_log.csv)",
+      "Bash(git -C /Users/itsgeonu/quant-strategy-pipeline show HEAD:results/equity_curve.csv)",
+      "Bash(git -C /Users/itsgeonu/quant-strategy-pipeline show:*)",
+      "Bash(ls:*)"
     ]
-  }
+  },
+  "spinnerTipsEnabled": true
 }

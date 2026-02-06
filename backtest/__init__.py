@@ -1,13 +1,5 @@
-"""
-Backtesting package for the Momentum Strategy.
+"""Backtesting Engine for RAAA Strategy"""
 
-This package provides tools for running and analyzing backtests
-of the momentum trading strategy.
+from .engine import BacktestEngine, Trade, EquitySnapshot, FundingEvent
 
-Modules:
-    engine: Main backtesting engine with performance analysis
-"""
-
-from backtest.engine import BacktestEngine
-
-__all__ = ["BacktestEngine"]
+__all__ = ['BacktestEngine', 'Trade', 'EquitySnapshot', 'FundingEvent']

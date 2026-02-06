@@ -1,274 +1,274 @@
-"""
-Data Pipeline for BTC MTF Strategy
 
-This module fetches OHLCV data for Bitcoin (BTC-USD) across multiple timeframes
-(15m, 1h, 4h, 1d) and calculates relevant indicators. The processed data is
-saved to the data/processed/ directory for use by the MTF strategy.
-
-Author: Data Agent
-Date: February 2026
-"""
-
-import logging
-import time
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
-
-import numpy as np
+import ccxt
 import pandas as pd
-import yfinance as yf
+import numpy as np
+import talib
+import os
+import time
+from datetime import datetime, timedelta
+import logging
 
-# Configure logging
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("data/pipeline.log"),
-    ],
+        logging.FileHandler("logs/pipeline.log"),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("DataPipeline")
 
+# Constants
+EXCHANGE_ID = 'okx'
+SYMBOLS = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
+TIMEFRAMES = ['15m', '1h', '4h']
+START_DATE = '2025-02-01 00:00:00'
+END_DATE = '2026-02-01 00:00:00'
+DATA_DIR = 'data/processed'
 
-class DataPipeline:
-    """
-    Data pipeline for fetching and processing Multi-Timeframe (MTF) Bitcoin data.
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
-    Features:
-    - Fetches BTC-USD data for 15m, 1h, 4h, 1d timeframes
-    - Calculates EMA (200), RSI (14), ATR (14) for each timeframe
-    - Aligns timestamps to UTC
-    - Saves individual timeframe files and a combined config
-    """
-
-    TIMEFRAMES = {
-        "15m": {"period": "60d", "interval": "15m"},   # Max allowable by yfinance for 15m
-        "1h":  {"period": "90d", "interval": "1h"},    # User requested 90 days
-        "4h":  {"period": "90d", "interval": "1h"},    # User requested 90 days (resampled from 1h)
-        "1d":  {"period": "1y",  "interval": "1d"},    # Need >200 data points for EMA(200)
-    }
-
-    def __init__(self, output_dir: str = "data/processed"):
-        """
-        Initialize the data pipeline.
-
-        Args:
-            output_dir: Directory path for saving processed data files.
-        """
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"DataPipeline initialized with output directory: {self.output_dir}")
-
-    def fetch_data(
-        self,
-        symbol: str,
-        interval: str,
-        period: str,
-        max_retries: int = 3,
-        retry_delay: float = 2.0,
-    ) -> Optional[pd.DataFrame]:
-        """
-        Fetch OHLCV data for a symbol from yfinance.
-
-        Args:
-            symbol: Stock ticker symbol (e.g., "BTC-USD").
-            interval: Data interval (e.g., "15m", "1h", "1d").
-            period: Data period (e.g., "60d", "730d", "max").
-            max_retries: Maximum number of retry attempts on failure.
-            retry_delay: Delay in seconds between retries.
-
-        Returns:
-            DataFrame with OHLCV data or None if fetch fails.
-        """
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Fetching {symbol} [{interval}] (attempt {attempt + 1}/{max_retries})")
-
-                ticker = yf.Ticker(symbol)
-                # Note: yfinance 'period' argument is used for intraday limits
-                df = ticker.history(period=period, interval=interval, auto_adjust=True)
-
-                if df.empty:
-                    logger.warning(f"No data returned for {symbol} [{interval}]")
-                    return None
-
-                # Standardize column names
-                df = df.reset_index()
-                # yfinance timestamps are timezone-aware, convert to UTC and remove tz info for parquet compat
-                if "Date" in df.columns:
-                    col_name = "Date"
-                else:
-                    col_name = "Datetime" # Intraday usually comes as Datetime
-                    df = df.rename(columns={"Datetime": "Date"})
-
-                df["Date"] = pd.to_datetime(df["Date"]).dt.tz_convert("UTC").dt.tz_localize(None)
-
-                # Keep required columns
-                required_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
-                # Filter strictly
-                available_cols = [c for c in required_cols if c in df.columns]
-                df = df[available_cols]
-
-                if len(available_cols) < 5: # Missing OHLVC
-                     logger.error(f"Missing columns in {symbol} data")
-                     return None
-
-                logger.info(f"Successfully fetched {len(df)} rows for {symbol} [{interval}]")
-                return df
-
-            except Exception as e:
-                logger.error(f"Error fetching {symbol} (attempt {attempt + 1}): {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-
-        logger.error(f"Failed to fetch data for {symbol} after {max_retries} attempts")
-        return None
-
-    def resample_data(self, df: pd.DataFrame, target_interval: str) -> pd.DataFrame:
-        """
-        Resample data to a higher timeframe (e.g., 1h -> 4h).
-        
-        Args:
-            df: Lower timeframe DataFrame (must have Date index or column).
-            target_interval: Target offset string (e.g., '4h').
-        
-        Returns:
-            Resampled DataFrame.
-        """
-        logger.info(f"Resampling data to {target_interval}...")
-        
-        df_copy = df.copy()
-        df_copy = df_copy.set_index("Date")
-        
-        # Resample logic
-        resampled = df_copy.resample(target_interval).agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum"
-        }).dropna()
-        
-        resampled = resampled.reset_index()
-        logger.info(f"Resampled to {len(resampled)} rows")
-        return resampled
-
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate technical indicators used in the strategy.
-        
-        Indicators:
-        - EMA 200 (Trend Baseline)
-        - RSI 14 (Momentum)
-        - ATR 14 (Volatility)
-        
-        Args:
-            df: DataFrame with OHLCV data.
-        
-        Returns:
-            DataFrame with added indicator columns.
-        """
-        prices = df["Close"]
-        
-        # 1. EMA 200
-        df["EMA_200"] = prices.ewm(span=200, adjust=False).mean()
-        
-        # 2. RSI 14
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        
-        # Note: Standard RSI uses Wilder's Smoothing, but Rolling Mean is often sufficient proxy.
-        # For precision matching Research, let's implement Wilder's if possible, or stick to simple for speed.
-        # Let's use EWM for Wilder's approximation which is standard in pandas/TA-Lib
-        # Wilder's Smoothing is equivalent to EMA with alpha=1/n
-        gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
-        
-        rs = gain / loss
-        df["RSI"] = 100 - (100 / (1 + rs))
-        df["RSI"] = df["RSI"].fillna(50)
-        
-        # 3. ATR 14
-        high = df["High"]
-        low = df["Low"]
-        close_prev = df["Close"].shift(1)
-        
-        tr1 = high - low
-        tr2 = abs(high - close_prev)
-        tr3 = abs(low - close_prev)
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
-        
-        return df
-
-    def process_timeframe(self, symbol: str, tf_name: str, config: Dict) -> Optional[pd.DataFrame]:
-        """
-        Pipeline step for a single timeframe.
-        """
-        # Special case for 4h: Fetch 1h and resample
-        if tf_name == "4h":
-            # Fetch 1h data first
-            df = self.fetch_data(symbol, "1h", config["period"])
-            if df is not None:
-                df = self.resample_data(df, "4h")
-        else:
-            df = self.fetch_data(symbol, config["interval"], config["period"])
+def fetch_ohlcv_history(exchange, symbol, timeframe, start_ts, end_ts):
+    """Fetch full history of OHLCV data."""
+    logger.info(f"Fetching {symbol} {timeframe} from {datetime.fromtimestamp(start_ts/1000)} to {datetime.fromtimestamp(end_ts/1000)}")
+    
+    all_ohlcv = []
+    since = start_ts
+    
+    while since < end_ts:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=100)
+            if not ohlcv:
+                break
             
-        if df is None:
-            return None
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
             
-        # Calculate Indicators
-        df = self.calculate_indicators(df)
-        
-        # Save
-        filename = f"{symbol}_{tf_name}.parquet"
-        filepath = self.output_dir / filename
-        df.to_parquet(filepath, index=False)
-        logger.info(f"Saved {tf_name} data to {filepath}")
-        
-        return df
-
-    def run(self, symbol: str = "BTC-USD") -> Dict[str, str]:
-        """
-        Run the pipeline for all timeframes.
-        
-        Args:
-            symbol: Ticker symbol (default: BTC-USD).
+            # Simple rate limit handling
+            time.sleep(exchange.rateLimit / 1000)
             
-        Returns:
-            Dictionary mapping timeframe names to file paths.
-        """
-        logger.info(f"Starting Multi-Timeframe Pipeline for {symbol}")
-        
-        results = {}
-        
-        for tf_name, config in self.TIMEFRAMES.items():
-            try:
-                df = self.process_timeframe(symbol, tf_name, config)
-                if df is not None:
-                    results[tf_name] = str(self.output_dir / f"{symbol}_{tf_name}.parquet")
-                else:
-                    results[tf_name] = None
-            except Exception as e:
-                logger.error(f"Failed to process {tf_name}: {e}")
-                results[tf_name] = None
+            if len(all_ohlcv) % 1000 == 0:
+                logger.info(f"Fetched {len(all_ohlcv)} candles so far...")
                 
-        # Summary
-        success_count = sum(1 for v in results.values() if v is not None)
-        logger.info("=" * 50)
-        logger.info(f"Pipeline Completed. Success: {success_count}/{len(self.TIMEFRAMES)}")
-        logger.info("=" * 50)
-        
-        return results
+        except Exception as e:
+            logger.error(f"Error fetching OHLCV: {e}")
+            time.sleep(5) # Backoff
+            
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df = df[(df['timestamp'] >= start_ts) & (df['timestamp'] <= end_ts)]
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    
+    # Remove duplicates if any
+    df = df[~df.index.duplicated(keep='first')]
+    
+    logger.info(f"Completed fetching {symbol} {timeframe}. Total rows: {len(df)}")
+    return df
 
+def fetch_funding_history(exchange, symbol, start_ts, end_ts):
+    """Fetch funding rate history."""
+    # Note: OKX API for funding history might require specific handling or might not cover full year easily via public API without pagination logic specific to it.
+    # ccxt `fetch_funding_rate_history` support varies.
+    # implementing a generic loop if supported, otherwise warning.
+    
+    logger.info(f"Fetching funding history for {symbol}...")
+    all_funding = []
+    since = start_ts
+    
+    # Check if exchange supports it
+    if not exchange.has['fetchFundingRateHistory']:
+        logger.warning("Exchange does not support fetchFundingRateHistory via ccxt directly or correctly.")
+        return pd.DataFrame()
+
+    while since < end_ts:
+        try:
+            funding = exchange.fetch_funding_rate_history(symbol, since=since, limit=100)
+            if not funding:
+                break
+            
+            all_funding.extend(funding)
+            since = funding[-1]['timestamp'] + 1
+            time.sleep(exchange.rateLimit / 1000)
+            
+        except Exception as e:
+            logger.error(f"Error fetching funding history: {e}")
+            break
+            
+    df = pd.DataFrame(all_funding)
+    if not df.empty:
+        df = df[['timestamp', 'fundingRate', 'symbol']]
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df[(df.index >= pd.to_datetime(start_ts, unit='ms')) & (df.index <= pd.to_datetime(end_ts, unit='ms'))]
+    
+    return df
+
+def calculate_indicators(df):
+    """Calculate technical indicators as per spec.md."""
+    # Ensure columns are float
+    o = df['open'].values
+    h = df['high'].values
+    l = df['low'].values
+    c = df['close'].values
+    v = df['volume'].values
+    
+    # --- Trend & Momentum ---
+    df['EMA_9'] = talib.EMA(c, timeperiod=9)
+    df['EMA_20'] = talib.EMA(c, timeperiod=20)
+    df['EMA_50'] = talib.EMA(c, timeperiod=50)
+    df['EMA_200'] = talib.EMA(c, timeperiod=200)
+    
+    df['RSI_14'] = talib.RSI(c, timeperiod=14)
+    
+    df['ADX_14'] = talib.ADX(h, l, c, timeperiod=14)
+    df['PLUS_DI_14'] = talib.PLUS_DI(h, l, c, timeperiod=14)
+    df['MINUS_DI_14'] = talib.MINUS_DI(h, l, c, timeperiod=14)
+    
+    df['MOM_12'] = talib.MOM(c, timeperiod=12)
+    
+    # --- Volatility ---
+    df['ATR_14'] = talib.ATR(h, l, c, timeperiod=14)
+    # ATR Percentile (rolling rank over 50 bars) -> Need pandas rolling
+    # Rank of current ATR relative to last 50 ATRs
+    df['ATR_PCT_RANK_50'] = df['ATR_14'].rolling(50).rank(pct=True) * 100
+    
+    # Bollinger Bands (20, 2.0)
+    df['BB_UPPER'], df['BB_MIDDLE'], df['BB_LOWER'] = talib.BBANDS(c, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
+    
+    # Bollinger Bands (20, 2.5) for Chop Strategy
+    df['BB_UPPER_2.5'], _, df['BB_LOWER_2.5'] = talib.BBANDS(c, timeperiod=20, nbdevup=2.5, nbdevdn=2.5, matype=0)
+    
+    # Keltner Channel (20, 1.5 ATR)
+    # KC Middle is EMA 20 usually, or SMA. Spec says Keltner(20, 1.5). Usually uses EMA.
+    # Let's use EMA_20 as middle.
+    kc_middle = df['EMA_20']
+    kc_range = 1.5 * df['ATR_14']
+    df['KC_UPPER'] = kc_middle + kc_range
+    df['KC_LOWER'] = kc_middle - kc_range
+    
+    # BB Width Percentile
+    # BB Width = (Upper - Lower) / Middle
+    df['BB_WIDTH'] = (df['BB_UPPER'] - df['BB_LOWER']) / df['BB_MIDDLE']
+    df['BB_WIDTH_PCT_RANK_50'] = df['BB_WIDTH'].rolling(50).rank(pct=True) * 100
+    
+    # --- Structure ---
+    # Donchian Channel (20)
+    df['DONCHIAN_UPPER_20'] = df['high'].rolling(20).max()
+    df['DONCHIAN_LOWER_20'] = df['low'].rolling(20).min()
+    
+    # Volume SMA
+    df['VOL_SMA_20'] = talib.SMA(v, timeperiod=20)
+    
+    return df
+
+def calculate_cross_asset(btc_df, eth_df, timeframe_suffix):
+    """Calculate cross-asset correlations and ratios."""
+    # Merge on index
+    merged = pd.merge(btc_df['close'], eth_df['close'], left_index=True, right_index=True, suffixes=('_BTC', '_ETH'))
+    
+    # Rolling Correlation 48 bars (Spec says 48H, but for 4H bars it's 12 bars? 
+    # Spec 362: "BTC-ETH Rolling Correlation: 48 bars (4H 기준)" -> implies 48 * 4H = 8 days? 
+    # Or "48H" means 48 hours?
+    # Spec 168: "Rolling Correlation(48H)" -> 48 Hours.
+    # At 4H timeframe, 48 hours = 12 bars.
+    # At 1H timeframe, 48 hours = 48 bars.
+    # At 15m timeframe, 48 hours = 192 bars.
+    # Let's use 48 hours equivalent window.
+    
+    # But Spec line 362 says "48 bars (4H 기준)". This might mean "48 bars window calculated on 4H candles".
+    # Since we are processing each TF, let's just stick to a fixed window or try to interpret.
+    # I will assume 48 bars for now as per line 362 text, or maybe 12 bars if it meant 48H time.
+    # Line 362: "BTC-ETH Rolling Correlation: 48 bars (4H 기준)" -> implies window size is 48 on 4H chart.
+    
+    window = 48
+    corr = merged['close_BTC'].rolling(window).corr(merged['close_ETH'])
+    
+    # ETH/BTC Ratio
+    ratio = merged['close_ETH'] / merged['close_BTC']
+    
+    # Ratio BB(20, 2.0)
+    ratio_upper, ratio_middle, ratio_lower = talib.BBANDS(ratio.values, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
+    
+    return corr, ratio, ratio_upper, ratio_lower
 
 def main():
-    """Main entry point."""
-    pipeline = DataPipeline()
-    pipeline.run(symbol="BTC-USD")
-
+    ensure_dir(DATA_DIR)
+    ensure_dir('logs')
+    
+    exchange = ccxt.okx()
+    
+    start_ts = int(pd.Timestamp(START_DATE).timestamp() * 1000)
+    end_ts = int(pd.Timestamp(END_DATE).timestamp() * 1000)
+    
+    # Store DFs to calculate cross-asset later
+    data_store = {} # { 'BTC_1H': df, ... }
+    
+    for symbol in SYMBOLS:
+        symbol_slug = symbol.split('/')[0] # BTC or ETH
+        
+        # Funding Rate (One per symbol, valid for all TFs)
+        funding_df = fetch_funding_history(exchange, symbol, start_ts, end_ts)
+        if not funding_df.empty:
+            funding_path = os.path.join(DATA_DIR, f"{symbol_slug}_funding.parquet")
+            funding_df.to_parquet(funding_path)
+            logger.info(f"Saved funding rates to {funding_path}")
+            
+        for tf in TIMEFRAMES:
+            logger.info(f"Processing {symbol} {tf}...")
+            df = fetch_ohlcv_history(exchange, symbol, tf, start_ts, end_ts)
+            
+            if df.empty:
+                logger.warning(f"No data for {symbol} {tf}")
+                continue
+                
+            df = calculate_indicators(df)
+            
+            key = f"{symbol_slug}_{tf}"
+            data_store[key] = df
+            
+            # Save individual processed data
+            path = os.path.join(DATA_DIR, f"{symbol_slug}_{tf}.parquet")
+            df.to_parquet(path)
+            logger.info(f"Saved {path}")
+            
+    # Calculate Cross correlations if we have both BTC and ETH for same TFs
+    for tf in TIMEFRAMES:
+        btc_key = f"BTC_{tf}"
+        eth_key = f"ETH_{tf}"
+        
+        if btc_key in data_store and eth_key in data_store:
+            btc_df = data_store[btc_key]
+            eth_df = data_store[eth_key]
+            
+            logger.info(f"Calculating cross-asset metrics for {tf}...")
+            corr, ratio, r_up, r_low = calculate_cross_asset(btc_df, eth_df, tf)
+            
+            # We need to save these. We can append to the individual files or save separate cross file.
+            # Easier to append to each file or just ETH file (since ratio is ETH/BTC).
+            # Spec implies these are available globally.
+            # Let's add CORR and RATIO to both DF or just use them in strategy.
+            # For pipeline, let's add to valid dataframes and re-save.
+            
+            # Add to BTC
+            btc_df['CORR_BTC_ETH'] = corr
+            # BTC doesn't really have a ratio in its own context usually, but Correlation is useful.
+            
+            # Add to ETH
+            eth_df['CORR_BTC_ETH'] = corr
+            eth_df['ETH_BTC_RATIO'] = ratio
+            eth_df['ETH_BTC_RATIO_UPPER'] = r_up
+            eth_df['ETH_BTC_RATIO_LOWER'] = r_low
+            
+            # Re-save
+            btc_path = os.path.join(DATA_DIR, f"BTC_{tf}.parquet")
+            eth_path = os.path.join(DATA_DIR, f"ETH_{tf}.parquet")
+            
+            btc_df.to_parquet(btc_path)
+            eth_df.to_parquet(eth_path)
+            logger.info(f"Updated {tf} parquets with cross-asset data.")
 
 if __name__ == "__main__":
     main()
